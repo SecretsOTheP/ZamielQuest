@@ -1,0 +1,1853 @@
+#!/usr/bin/perl -w
+
+# To do:
+# - click off detrimental
+# - buff timer
+# - /mem
+# - 30 second camp
+# - add /wt X
+# - add anon check before /zone
+# - add gating to zone route calculation
+# - bug - vahshir doesn't get ultravision?
+# - add movement packet send right before spell finishes
+# - stop notify cheater
+# - trade no drop
+# - equip 500 hp girdles
+
+use strict;
+use IO::Socket::INET;
+use threads;
+use threads::shared;
+use Scalar::Util qw(looks_like_number);
+use Math::Trig;
+use IPC::Open2;
+
+# Force a flush after every write
+$| = 1;
+
+# Functions
+use constant ADDRESS_CommandHook => "0x2902D2";
+use constant ADDRESS_CommandHookEnd => "0x2904A0";
+use constant ADDRESS_ChatHook => "0x280270";
+use constant ADDRESS_SitStandHook => "0x261563";
+use constant ADDRESS_SetupEQPlayers => "0xE5B60";
+use constant ADDRESS_DoPassageOfTime => "0x117A90";
+use constant ADDRESS_CastingWndDeactivate => "0xBD480";
+
+# Pointers
+use constant ADDRESS_LocalPC => "0x4CCCCC"; # _CHARINFO, EQPlayer*
+use constant ADDRESS_LocalPlayer => "0x4CCCE8"; # _SPAWNINFO
+use constant ADDRESS_TargetPlayer => "0x4CCCC8";
+use constant ADDRESS_CurrentZone => "0x60664C";
+use constant ADDRESS_SafeSpotX => "0x5E596C";
+use constant ADDRESS_LootWnd => "0x4B9AA8";
+
+# Hacks
+use constant ADDRESS_CheckForUnderWorld => "0xF9293";
+use constant ADDRESS_Ultravision => "0x10D1C4";
+use constant ADDRESS_SeeInvis => "0x10D149";
+use constant ADDRESS_FallDamage => "0x25D4EE";
+use constant ADDRESS_EnvDamage => "0x113F45";
+use constant ADDRESS_EnduringBreath => "0x1D9E6C";
+use constant ADDRESS_CompassFix => "0x3AD2B1";
+use constant ADDRESS_Stun => "0x206350";
+
+my @ThreadList = ();
+my @ThreadListPID = ();
+my $ThreadCounter = 0;
+my $InstanceCheckTimer = time + 5;
+my $PID;
+my $socket;
+my $data;
+my $temp;
+my $temp2;
+my $temp3;
+my $CharacterName;
+my $SuppressCommand;
+my $MyX;
+my $MyY;
+my $MyZ;
+#my $GhostX;
+#my $GhostY;
+#my $GhostZ;
+#my $CastingX;
+#my $CastingY;
+#my $CastingZ;
+my $TargetX;
+my $TargetY;
+my $TargetZ;
+my $TargetName;
+my $CurrentZone;
+my $Heading;
+my $CommandToPass :shared;
+my $CommandToAll :shared = 0;
+my $GDBInterrupted = 0;
+my $Fading = 0;
+my $Zoning = 0;
+my $EndZone;
+my $ShortestPath;
+my @ShortestPathList;
+my $Ignore = 0;
+my @CorpseDragging = ();
+my $SitSticking = 0;
+my $MacroOn = 0;
+#my $WaitingForRez = 0;
+#my $GhostKill = 0;
+
+my %ZoneConnection = (
+	"South Qeynos" => ["North Qeynos", "Qeynos Catacombs"],
+	"North Qeynos" => ["South Qeynos", "Qeynos Hills", "Qeynos Catacombs", "Plane of Knowledge"],
+	"Surefall Glade" => ["Qeynos Hills", "The Jaggedpine Forest"],
+	"Qeynos Hills" => ["North Qeynos", "BlackBurrow", "West Karana", "Surefall Glade"],
+	"Highpass Hold" => ["East Karana", "Kithicor Forest", "HighKeep"],
+	"HighKeep" => ["Highpass Hold"],
+	"North Freeport" => ["West Freeport"],
+	"West Freeport" => ["East Commonlands", "North Freeport", "East Freeport", "Plane of Knowledge"],
+	"East Freeport" => ["West Freeport", "North Ro"],
+	"Clan RunnyEye" => ["Misty Thicket", "Gorge of King Xorbb"],
+	"West Karana" => ["Qeynos Hills", "North Karana"],
+	"North Karana" => ["West Karana", "East Karana", "South Karana", "The Nexus"],
+	"South Karana" => ["North Karana", "Lake Rathetear", "Infected Paw"],
+	"East Karana" => ["North Karana", "Highpass Hold", "Gorge of King Xorbb"],
+	"Gorge of King Xorbb" => ["East Karana", "Clan RunnyEye"],
+	"BlackBurrow" => ["Qeynos Hills", "Everfrost Peaks", "The Jaggedpine Forest"],
+	"Infected Paw" => ["South Karana"],
+	"Rivervale" => ["Kithicor Forest", "Misty Thicket"],
+	"Kithicor Forest" => ["Rivervale", "West Commonlands", "Highpass Hold"],
+	"West Commonlands" => ["East Commonlands", "Kithicor Forest", "Befallen"],
+	"East Commonlands" => ["West Commonlands", "Nektulos Forest", "North Ro", "West Freeport"],
+	"Erudin Palace" => ["Erudin"],
+	"Erudin" => ["Toxxulia Forest", "Erudin Palace"],
+	"Nektulos Forest" => ["Neriak Foreign Quarter", "East Commonlands", "Lavastorm Mountains", "Plane of Knowledge"],
+	"Lavastorm Mountains" => ["Temple of Solusek Ro", "Solusek's Eye", "Nagafen's Lair", "Najena", "Nektulos Forest"],
+	"Halas" => ["Everfrost Peaks"],
+	"Everfrost Peaks" => ["Halas", "BlackBurrow", "Permafrost Keep", "Plane of Knowledge"],
+	"Solusek's Eye" => ["Lavastorm Mountains", "Nagafen's Lair"],
+	"Nagafen's Lair" => ["Lavastorm Mountains", "Solusek's Eye"],
+	"Misty Thicket" => ["Rivervale", "Clan RunnyEye", "Plane of Knowledge"],
+	"North Ro" => ["East Freeport", "East Commonlands", "Iceclad Ocean", "Oasis of Marr"],
+	"South Ro" => ["Innothule Swamp", "Oasis of Marr"],
+	"Befallen" => ["West Commonlands"],
+	"Oasis of Marr" => ["North Ro", "South Ro"],
+	"Toxxulia Forest" => ["Kerra Isle", "Erudin", "Paineel", "Plane of Knowledge", "The Nexus"],
+	"The Ruins of Old Paineel" => ["Paineel"],
+	"Neriak Foreign Quarter" => ["Nektulos Forest", "Neriak Commons"],
+	"Neriak Commons" => ["Neriak Foreign Quarter", "Neriak Third Gate"],
+	"Neriak Third Gate" => ["Neriak Commons"],
+	"Najena" => ["Lavastorm Mountains"],
+	"Qeynos Catacombs" => ["North Qeynos", "South Qeynos"],
+	"Innothule Swamp" => ["Grobb", "Upper Guk", "South Ro", "The Feerrott", "Plane of Knowledge"],
+	"The Feerrott" => ["Mountains of Rathe", "Oggok", "Cazic-Thule", "Plane of Fear", "Innothule Swamp", "Plane of Knowledge"],
+	"Cazic-Thule" => ["The Feerrott"],
+	"Oggok" => ["The Feerrott"],
+	"Mountains of Rathe" => ["Lake Rathetear", "The Feerrott"],
+	"Lake Rathetear" => ["South Karana", "The Arena", "Mountains of Rathe"],
+	"Grobb" => ["Innothule Swamp"],
+	"Greater Faydark" => ["North Felwithe", "Butcherblock Mountains", "Lesser Faydark", "Clan Crushbone", "Plane of Knowledge"], # The Nexus isn't actually connected
+	"Ak'Anon" => ["Steamfont Mountains"],
+	"Steamfont Mountains" => ["Lesser Faydark", "Ak'Anon", "Plane of Knowledge"],
+	"Lesser Faydark" => ["Greater Faydark", "Steamfont Mountains", "Castle Mistmoore"],
+	"Clan Crushbone" => ["Greater Faydark"],
+	"Castle Mistmoore" => ["Lesser Faydark"],
+	"South Kaladim" => ["Butcherblock Mountains", "North Kaladim"],
+	"North Felwithe" => ["Greater Faydark", "South Felwithe"],
+	"South Felwithe" => ["North Felwithe"],
+	"Estate of Unrest" => ["Dagnor's Cauldron"],
+	"Kedge Keep" => ["Dagnor's Cauldron"],
+	"Upper Guk" => ["Innothule Swamp", "Lower Guk"],
+	"Lower Guk" => ["Upper Guk"],
+	"North Kaladim" => ["South Kaladim"],
+	"Butcherblock Mountains" => ["Greater Faydark", "South Kaladim", "Dagnor's Cauldron", "Plane of Knowledge"],
+	"Ocean of Tears" => [], # Oceans are bugged
+	"Dagnor's Cauldron" => ["Butcherblock Mountains", "Estate of Unrest", "Kedge Keep"],
+	"Plane of Sky" => ["East Freeport"],
+	"Plane of Fear" => [], # No zone out
+	"Permafrost Keep" => ["Everfrost Peaks"],
+	"Kerra Isle" => ["Toxxulia Forest"],
+	"Paineel" => ["The Ruins of Old Paineel", "Toxxulia Forest", "The Warrens"],
+	"The Arena" => ["Lake Rathetear"],
+	"The Field of Bone" => ["East Cabilis", "Warsliks Wood", "Swamp of No Hope", "The Emerald Jungle", "Kurn's Tower", "Kaesora", "Plane of Knowledge"],
+	"Warsliks Wood" => ["West Cabilis", "The Field of Bone", "Lake of Ill Omen", "The Overthere", "Dalnir"],
+	"Temple of Solusek Ro" => ["Lavastorm Mountains"],
+	"Temple of Droga" => ["Mines of Nurga", "Frontier Mountians"],
+	"West Cabilis" => ["Warsliks Wood", "Lake of Ill Omen", "East Cabilis"],
+	"Swamp of No Hope" => ["East Cabilis", "The Field of Bone", "Firiona Vie", "Trakanon's Teeth"],
+	"Firiona Vie" => ["Dreadlands", "Lake of Ill Omen", "Swamp of No Hope", "Plane of Knowledge"],
+	"Lake of Ill Omen" => ["West Cabilis", "Firiona Vie", "Frontier Mountains", "Warsliks Wood"],
+	"Dreadlands" => ["Burning Woods", "Frontier Mountains", "Firiona Vie", "Karnor's Castle", "The Nexus"],
+	"Burning Woods" => ["Frontier Mountains", "Dreadlands", "Skyfire Mountains", "Chardok"],
+	"Kaesora" => ["The Field of Bone"],
+	"Old Sebilis" => ["Trakanon's Teeth"],
+	"City of Mist" => ["The Emerald Jungle"],
+	"Skyfire Mountains" => ["Burning Woods", "The Overthere", "Veeshan's Peak"],
+	"Frontier Mountains" => ["Burning Woods", "Dreadlands", "Lake of Ill Omen", "The Overthere", "Mines of Nurga", "Temple of Droga"],
+	"The Overthere" => ["Frontier Mountains", "Howling Stones", "Skyfire Mountains", "Warsliks Wood", "Plane of Knowledge"],
+	"The Emerald Jungle" => ["City of Mist", "The Field of Bone", "Trakanon's Teeth"],
+	"Trakanon's Teeth" => ["The Emerald Jungle", "Swamp of No Hope", "Old Sebilis"],
+	"Timorous Deep" => [], # Oceans are bugged
+	"Kurn's Tower" => ["The Field of Bone"],
+	"Erud's Crossing" => [], # Oceans are bugged
+	"Stonebrunt Mountains" => ["The Warrens"],
+	"The Warrens" => ["Paineel", "Stonebrunt Mountains"],
+	"Karnor's Castle" => ["Dreadlands"],
+	"Chardok" => ["Burning Woods"],
+	"Dalnir" => ["Warsliks Wood"],
+	"Howling Stones" => ["The Overthere"],
+	"East Cabilis" => ["The Field of Bone", "Swamp of No Hope", "West Cabilis"],
+	"Mines of Nurga" => ["Temple of Droga", "Frontier Mountains"],
+	"Veeshan's Peak" => ["Plane of Sky", "Skyfire Mountains", "Swamp of No Hope", "East Freeport"],
+	"Iceclad Ocean" => ["North Ro", "Eastern Wastes", "Tower of Frozen Shadow"],
+	"Tower of Frozen Shadow" => ["Iceclad Ocean"],
+	"Velketor's Labyrinth" => ["Great Divide"],
+	"Kael Drakkal" => ["Eastern Wastes", "The Wakening Land"],
+	"Skyshrine" => ["Cobalt Scar", "The Wakening Land"],
+	"Thurgadin" => ["Great Divide", "Icewell Keep"],
+	"Eastern Wastes" => ["Crystal Caverns", "Iceclad Ocean", "Great Divide", "Kael Drakkal", "Sleeper's Tomb"],
+	"Cobalt Scar" => ["Skyshrine", "Siren's Grotto"],
+	"Great Divide" => ["Eastern Wastes", "Thurgadin", "Velketor's Labyrinth", "Plane of Knowledge", "The Nexus"],
+	"The Wakening Land" => ["Kael Drakkal", "Plane of Growth", "Skyshrine"],
+	"Western Wastes" => ["Dragon Necropolis", "Siren's Grotto", "Temple of Veeshan"],
+	"Crystal Caverns" => ["Eastern Wastes"],
+	"Dragon Necropolis" => ["Western Wastes"],
+	"Temple of Veeshan" => ["Western Wastes", "Plane of Mischief"],
+	"Siren's Grotto" => ["Cobalt Scar", "Western Wastes"],
+	"Plane of Mischief" => ["Cobalt Scar"],
+	"Plane of Growth" => [],
+	"Sleeper's Tomb" => ["Eastern Wastes"],
+	"Icewell Keep" => ["Thurgadin"],
+	"Shadow Haven" => ["The Bazaar", "Echo Caverns", "The Nexus", "Paludal Caverns"],
+	"The Bazaar" => ["The Nexus", "Shadow Haven"],
+	"The Nexus" => ["The Bazaar", "Netherbian Lair", "Shadow Haven", "Plane of Knowledge", "North Karana", "Toxxulia Forest", "Dreadlands", "Great Divide"], # Greater Faydark isn't actually connected
+	"Echo Caverns" => ["The Deep", "Fungus Grove", "Shadow Haven"],
+	"Acrylia Caverns" => ["Grimling Forest"],
+	"Shar Vahl" => ["Hollowshade Moor", "Shadeweaver's Thicket"],
+	"Paludal Caverns" => ["Hollowshade Moor", "Shadeweaver's Thicket", "Shadow Haven"],
+	"Fungus Grove" => ["Echo Caverns", "The Twilight Sea"],
+	"Vex Thal" => ["The Umbral Plains"],
+	"Sanctus Seru" => ["Dawnshroud Peaks", "Marus Seru"],
+	"Katta Castellum" => ["The Tenebrous Mountains", "The Twilight Sea"],
+	"Netherbian Lair" => ["Dawnshroud Peaks", "Marus Seru", "The Nexus"],
+	"Ssraeshza Temple" => ["The Deep", "The Grey"],
+	"Grieg's End" => ["Dawnshroud Peaks", "The Scarlet Desert"],
+	"The Deep" => ["Echo Caverns", "Ssraeshza Temple"],
+	"Shadeweaver's Thicket" => ["Paludal Caverns", "Shar Vahl", "Plane of Knowledge"],
+	"Hollowshade Moor" => ["Grimling Forest", "Paludal Caverns", "Shar Vahl"],
+	"Grimling Forest" => ["Acrylia Caverns", "Hollowshade Moor", "The Tenebrous Mountains"],
+	"Marus Seru" => ["Mons Letalis", "Netherbian Lair", "Sanctus Seru"],
+	"Mons Letalis" => ["The Grey", "Marus Seru"],
+	"The Twilight Sea" => ["Fungus Grove", "Katta Castellum", "The Scarlet Desert"],
+	"The Grey" => ["Mons Letalis", "The Scarlet Desert", "Ssraeshza Temple"],
+	"The Tenebrous Mountains" => ["Grimling Forest", "Katta Castellum"],
+	"The Maiden's Eye" => ["Akheva Ruins", "Dawnshroud Peaks", "The Umbral Plains"],
+	"Dawnshroud Peaks" => ["Grieg's End", "The Maiden's Eye", "Netherbian Lair", "Sanctus Seru"],
+	"The Scarlet Desert" => ["The Grey", "Grieg's End", "The Twilight Sea"],
+	"The Umbral Plains" => ["The Maiden's Eye", "Vex Thal"],
+	"Akheva Ruins" => ["The Maiden's Eye"],
+	"The Jaggedpine Forest" => ["BlackBurrow", "Surefall Glade"],
+	"Plane of Hate" => [], # No zone out
+	"Ruins of Lxanvom" => ["Plane of Tranquility"],
+	"Plane of Justice" => ["Plane of Tranquility"],
+	"Plane of Knowledge" => ["Misty Thicket", "Greater Faydark", "Butcherblock Mountains", "Everfrost Peaks", "Toxxulia Forest", "The Nexus", "Great Divide", "Shadeweaver's Thicket", "North Qeynos", "Plane of Tranquility", "Firiona Vie", "West Freeport", "Steamfont Mountains", "The Field of Bone", "Innothule Swamp", "Nektulos Forest", "The Feerrott", "The Overthere"],
+	"Plane of Tranquility" => ["Torden, The Bastion of Thunder", "Doomfire, The Burning Lands", "Drunder, Fortress of Zek", "Eryslai, the Kingdom of Wind", "Halls of Honor", "Plane of Disease", "Ruins of Lxanvom", "Plane of Innovation", "Plane of Justice", "Plane of Knowledge", "Plane of Nightmare", "Plane of Storms", "Plane of Time A", "Plane of Torment", "Plane of Valor", "Reef of Coirnav", "Solusek Ro's Tower", "Vegarlson, The Earthen Badlands"],
+	"Plane of Nightmare" => ["Plane of Tranquility", "Lair of Terris Thule"],
+	"Plane of Disease" => ["Plane of Tranquility", "Ruins of Lxanvom"],
+	"Plane of Innovation" => ["Plane of Tranquility", "Plane of Time A"],
+	"Plane of Torment" => ["Plane of Tranquility"],
+	"Plane of Valor" => ["Plane of Tranquility", "Halls of Honor"],
+	"Torden, The Bastion of Thunder" => ["Plane of Tranquility"],
+	"Plane of Storms" => ["Plane of Tranquility", "Torden, The Bastion of Thunder"],
+	"Halls of Honor" => ["Plane of Tranquility", "Temple of Marr"],
+	"Solusek Ro's Tower" => ["Plane of Tranquility", "Doomfire, The Burning Lands"],
+	"Drunder, Fortress of Zek" => ["Plane of Tranquility"],
+	"Eryslai, the Kingdom of Wind" => ["Plane of Tranquility"],
+	"Reef of Coirnav" => ["Plane of Tranquility"],
+	"Doomfire, The Burning Lands" => ["Plane of Tranquility"],
+	"Vegarlson, The Earthen Badlands" => ["Plane of Tranquility", "Stronghold of the Twelve"],
+	"Plane of Time A" => ["Plane of Tranquility", "Plane of Time B"],
+	"Temple of Marr" => ["Halls of Honor"],
+	"Lair of Terris Thule" => ["Plane of Nightmare"],
+	"Stronghold of the Twelve" => ["Vegarlson, The Earthen Badlands"],
+	"Plane of Time B" => ["Plane of Time A"],
+);
+
+my %ZoneShortName = (
+	"South Qeynos" => "qeynos",
+	"North Qeynos" => "qeynos2",
+	"Surefall Glade" => "qrg",
+	"Qeynos Hills" => "qeytoqrg",
+	"Highpass Hold" => "highpass",
+	"HighKeep" => "highkeep",
+	"North Freeport" => "freportn",
+	"West Freeport" => "freportw",
+	"East Freeport" => "freporte",
+	"Clan RunnyEye" => "runnyeye",
+	"West Karana" => "qey2hh1",
+	"North Karana" => "northkarana",
+	"South Karana" => "southkarana",
+	"East Karana" => "eastkarana",
+	"Gorge of King Xorbb" => "beholder",
+	"BlackBurrow" => "blackburrow",
+	"Infected Paw" => "paw",
+	"Rivervale" => "rivervale",
+	"Kithicor Forest" => "kithicor",
+	"West Commonlands" => "commons",
+	"East Commonlands" => "ecommons",
+	"Erudin Palace" => "erudnint",
+	"Erudin" => "erudnext",
+	"Nektulos Forest" => "nektulos",
+	"Lavastorm Mountains" => "lavastorm",
+	"Halas" => "halas",
+	"Everfrost Peaks" => "everfrost",
+	"Solusek's Eye" => "soldunga",
+	"Nagafen's Lair" => "soldungb",
+	"Misty Thicket" => "misty",
+	"North Ro" => "nro",
+	"South Ro" => "sro",
+	"Befallen" => "befallen",
+	"Oasis of Marr" => "oasis",
+	"Toxxulia Forest" => "tox",
+	"The Ruins of Old Paineel" => "hole",
+	"Neriak Foreign Quarter" => "neriaka",
+	"Neriak Commons" => "neriakb",
+	"Neriak Third Gate" => "neriakc",
+	"Najena" => "najena",
+	"Qeynos Catacombs" => "qcat",
+	"Innothule Swamp" => "innothule",
+	"The Feerrott" => "feerrott",
+	"Cazic-Thule" => "cazicthule",
+	"Oggok" => "oggok",
+	"Mountains of Rathe" => "rathemtn",
+	"Lake Rathetear" => "lakerathe",
+	"Grobb" => "grobb",
+	"Greater Faydark" => "gfaydark",
+	"Ak'Anon" => "akanon",
+	"Steamfont Mountains" => "steamfont",
+	"Lesser Faydark" => "lfaydark",
+	"Clan Crushbone" => "crushbone",
+	"Castle Mistmoore" => "mistmoore",
+	"South Kaladim" => "kaladima",
+	"North Felwithe" => "felwithea",
+	"South Felwithe" => "felwitheb",
+	"Estate of Unrest" => "unrest",
+	"Kedge Keep" => "kedge",
+	"Upper Guk" => "guktop",
+	"Lower Guk" => "gukbottom",
+	"North Kaladim" => "kaladimb",
+	"Butcherblock Mountains" => "butcher",
+	"Ocean of Tears" => "oot",
+	"Dagnor's Cauldron" => "cauldron",
+	"Plane of Sky" => "airplane",
+	"Plane of Fear" => "fearplane",
+	"Permafrost Keep" => "permafrost",
+	"Kerra Isle" => "kerraridge",
+	"Paineel" => "paineel",
+	"The Arena" => "arena",
+	"The Field of Bone" => "fieldofbone",
+	"Warsliks Wood" => "warslikswood",
+	"Temple of Solusek Ro" => "soltemple",
+	"Temple of Droga" => "droga",
+	"West Cabilis" => "cabwest",
+	"Swamp of No Hope" => "swampofnohope",
+	"Firiona Vie" => "firiona",
+	"Lake of Ill Omen" => "lakeofillomen",
+	"Dreadlands" => "dreadlands",
+	"Burning Woods" => "burningwood",
+	"Kaesora" => "kaesora",
+	"Old Sebilis" => "sebilis",
+	"City of Mist" => "citymist",
+	"Skyfire Mountains" => "skyfire",
+	"Frontier Mountains" => "frontiermtns",
+	"The Overthere" => "overthere",
+	"The Emerald Jungle" => "emeraldjungle",
+	"Trakanon's Teeth" => "trakanon",
+	"Timorous Deep" => "timorous",
+	"Kurn's Tower" => "kurn",
+	"Erud's Crossing" => "erudsxing",
+	"Stonebrunt Mountains" => "stonebrunt",
+	"The Warrens" => "warrens",
+	"Karnor's Castle" => "karnor",
+	"Chardok" => "chardok",
+	"Dalnir" => "dalnir",
+	"Howling Stones" => "charasis",
+	"East Cabilis" => "cabeast",
+	"Mines of Nurga" => "nurga",
+	"Veeshan's Peak" => "veeshan",
+	"Iceclad Ocean" => "iceclad",
+	"Tower of Frozen Shadow" => "frozenshadow",
+	"Velketor's Labyrinth" => "velketor",
+	"Kael Drakkal" => "kael",
+	"Skyshrine" => "skyshrine",
+	"Thurgadin" => "thurgadina",
+	"Eastern Wastes" => "eastwastes",
+	"Cobalt Scar" => "cobaltscar",
+	"Great Divide" => "greatdivide",
+	"The Wakening Land" => "wakening",
+	"Western Wastes" => "westwastes",
+	"Crystal Caverns" => "crystal",
+	"Dragon Necropolis" => "necropolis",
+	"Temple of Veeshan" => "templeveeshan",
+	"Siren's Grotto" => "sirens",
+	"Plane of Mischief" => "mischiefplane",
+	"Plane of Growth" => "growthplane",
+	"Sleeper's Tomb" => "sleeper",
+	"Icewell Keep" => "thurgadinb",
+	"Shadow Haven" => "shadowhaven",
+	"The Bazaar" => "bazaar",
+	"The Nexus" => "nexus",
+	"Echo Caverns" => "echo",
+	"Acrylia Caverns" => "acrylia",
+	"Shar Vahl" => "sharvahl",
+	"Paludal Caverns" => "paludal",
+	"Fungus Grove" => "fungusgrove",
+	"Vex Thal" => "vexthal",
+	"Sanctus Seru" => "sseru",
+	"Katta Castellum" => "katta",
+	"Netherbian Lair" => "netherbian",
+	"Ssraeshza Temple" => "ssratemple",
+	"Grieg's End" => "griegsend",
+	"The Deep" => "thedeep",
+	"Shadeweaver's Thicket" => "shadeweaver",
+	"Hollowshade Moor" => "hollowshade",
+	"Grimling Forest" => "grimling",
+	"Marus Seru" => "mseru",
+	"Mons Letalis" => "letalis",
+	"The Twilight Sea" => "twilight",
+	"The Grey" => "thegrey",
+	"The Tenebrous Mountains" => "tenebrous",
+	"The Maiden's Eye" => "maiden",
+	"Dawnshroud Peaks" => "dawnshroud",
+	"The Scarlet Desert" => "scarlet",
+	"The Umbral Plains" => "umbral",
+	"Akheva Ruins" => "akheva",
+	"The Jaggedpine Forest" => "jaggedpine",
+	"Plane of Hate" => "hateplane",
+	"Ruins of Lxanvom" => "codecay",
+	"Plane of Justice" => "pojustice",
+	"Plane of Knowledge" => "poknowledge",
+	"Plane of Tranquility" => "potranquility",
+	"Plane of Nightmare" => "ponightmare",
+	"Plane of Disease" => "podisease",
+	"Plane of Innovation" => "poinnovation",
+	"Plane of Torment" => "potorment",
+	"Plane of Valor" => "povalor",
+	"Torden, The Bastion of Thunder" => "bothunder",
+	"Plane of Storms" => "postorms",
+	"Halls of Honor" => "hohonora",
+	"Solusek Ro's Tower" => "solrotower",
+	"Drunder, Fortress of Zek" => "potactics",
+	"Eryslai, the Kingdom of Wind" => "poair",
+	"Reef of Coirnav" => "powater",
+	"Doomfire, The Burning Lands" => "pofire",
+	"Vegarlson, The Earthen Badlands" => "poeartha",
+	"Plane of Time A" => "potimea",
+	"Temple of Marr" => "hohonorb",
+	"Lair of Terris Thule" => "nightmareb",
+	"Stronghold of the Twelve" => "poearthb",
+	"Plane of Time B" => "potimeb"
+);
+
+my %ZoneID = (
+	1 => "South Qeynos",
+	2 => "North Qeynos",
+	3 => "Surefall Glade",
+	4 => "Qeynos Hills",
+	5 => "Highpass Hold",
+	6 => "HighKeep",
+	8 => "North Freeport",
+	9 => "West Freeport",
+	10 => "East Freeport",
+	11 => "Clan RunnyEye",
+	12 => "West Karana",
+	13 => "North Karana",
+	14 => "South Karana",
+	15 => "East Karana",
+	16 => "Gorge of King Xorbb",
+	17 => "BlackBurrow",
+	18 => "Infected Paw",
+	19 => "Rivervale",
+	20 => "Kithicor Forest",
+	21 => "West Commonlands",
+	22 => "East Commonlands",
+	23 => "Erudin Palace",
+	24 => "Erudin",
+	25 => "Nektulos Forest",
+	27 => "Lavastorm Mountains",
+	29 => "Halas",
+	30 => "Everfrost Peaks",
+	31 => "Solusek's Eye",
+	32 => "Nagafen's Lair",
+	33 => "Misty Thicket",
+	34 => "North Ro",
+	35 => "South Ro",
+	36 => "Befallen",
+	37 => "Oasis of Marr",
+	38 => "Toxxulia Forest",
+	39 => "The Ruins of Old Paineel",
+	40 => "Neriak Foreign Quarter",
+	41 => "Neriak Commons",
+	42 => "Neriak Third Gate",
+	44 => "Najena",
+	45 => "Qeynos Catacombs",
+	46 => "Innothule Swamp",
+	47 => "The Feerrott",
+	48 => "Cazic-Thule",
+	49 => "Oggok",
+	50 => "Mountains of Rathe",
+	51 => "Lake Rathetear",
+	52 => "Grobb",
+	54 => "Greater Faydark",
+	55 => "Ak'Anon",
+	56 => "Steamfont Mountains",
+	57 => "Lesser Faydark",
+	58 => "Clan Crushbone",
+	59 => "Castle Mistmoore",
+	60 => "South Kaladim",
+	61 => "North Felwithe",
+	62 => "South Felwithe",
+	63 => "Estate of Unrest",
+	64 => "Kedge Keep",
+	65 => "Upper Guk",
+	66 => "Lower Guk",
+	67 => "North Kaladim",
+	68 => "Butcherblock Mountains",
+	69 => "Ocean of Tears",
+	70 => "Dagnor's Cauldron",
+	71 => "Plane of Sky",
+	72 => "Plane of Fear",
+	73 => "Permafrost Keep",
+	74 => "Kerra Isle",
+	75 => "Paineel",
+	77 => "The Arena",
+	78 => "The Field of Bone",
+	79 => "Warsliks Wood",
+	80 => "Temple of Solusek Ro",
+	81 => "Temple of Droga",
+	82 => "West Cabilis",
+	83 => "Swamp of No Hope",
+	84 => "Firiona Vie",
+	85 => "Lake of Ill Omen",
+	86 => "Dreadlands",
+	87 => "Burning Woods",
+	88 => "Kaesora",
+	89 => "Old Sebilis",
+	90 => "City of Mist",
+	91 => "Skyfire Mountains",
+	92 => "Frontier Mountains",
+	93 => "The Overthere",
+	94 => "The Emerald Jungle",
+	95 => "Trakanon's Teeth",
+	96 => "Timorous Deep",
+	97 => "Kurn's Tower",
+	98 => "Erud's Crossing",
+	100 => "Stonebrunt Mountains",
+	101 => "The Warrens",
+	102 => "Karnor's Castle",
+	103 => "Chardok",
+	104 => "Dalnir",
+	105 => "Howling Stones",
+	106 => "East Cabilis",
+	107 => "Mines of Nurga",
+	108 => "Veeshan's Peak",
+	110 => "Iceclad Ocean",
+	111 => "Tower of Frozen Shadow",
+	112 => "Velketor's Labyrinth",
+	113 => "Kael Drakkal",
+	114 => "Skyshrine",
+	115 => "Thurgadin",
+	116 => "Eastern Wastes",
+	117 => "Cobalt Scar",
+	118 => "Great Divide",
+	119 => "The Wakening Land",
+	120 => "Western Wastes",
+	121 => "Crystal Caverns",
+	123 => "Dragon Necropolis",
+	124 => "Temple of Veeshan",
+	125 => "Siren's Grotto",
+	126 => "Plane of Mischief",
+	127 => "Plane of Growth",
+	128 => "Sleeper's Tomb",
+	129 => "Icewell Keep",
+	150 => "Shadow Haven",
+	151 => "The Bazaar",
+	152 => "The Nexus",
+	153 => "Echo Caverns",
+	154 => "Acrylia Caverns",
+	155 => "Shar Vahl",
+	156 => "Paludal Caverns",
+	157 => "Fungus Grove",
+	158 => "Vex Thal",
+	159 => "Sanctus Seru",
+	160 => "Katta Castellum",
+	161 => "Netherbian Lair",
+	162 => "Ssraeshza Temple",
+	163 => "Grieg's End",
+	164 => "The Deep",
+	165 => "Shadeweaver's Thicket",
+	166 => "Hollowshade Moor",
+	167 => "Grimling Forest",
+	168 => "Marus Seru",
+	169 => "Mons Letalis",
+	170 => "The Twilight Sea",
+	171 => "The Grey",
+	172 => "The Tenebrous Mountains",
+	173 => "The Maiden's Eye",
+	174 => "Dawnshroud Peaks",
+	175 => "The Scarlet Desert",
+	176 => "The Umbral Plains",
+	179 => "Akheva Ruins",
+	181 => "The Jaggedpine Forest",
+	200 => "Ruins of Lxanvom",
+	201 => "Plane of Justice",
+	202 => "Plane of Knowledge",
+	203 => "Plane of Tranquility",
+	204 => "Plane of Nightmare",
+	205 => "Plane of Disease",
+	206 => "Plane of Innovation",
+	207 => "Plane of Torment",
+	208 => "Plane of Valor",
+	209 => "Torden, The Bastion of Thunder",
+	210 => "Plane of Storms",
+	211 => "Halls of Honor",
+	212 => "Solusek Ro's Tower",
+	214 => "Drunder, Fortress of Zek",
+	215 => "Eryslai, the Kingdom of Wind",
+	216 => "Reef of Coirnav",
+	217 => "Doomfire, The Burning Lands",
+	218 => "Vegarlson, The Earthen Badlands",
+	219 => "Plane of Time A",
+	220 => "Temple of Marr",
+	221 => "Lair of Terris Thule",
+	222 => "Stronghold of the Twelve",
+	223 => "Plane of Time B"
+);
+
+my %ZoneAlias = (
+	"qey2" => "South Qeynos",
+	"qey" => "North Qeynos",
+	"sfg" => "Surefall Glade",
+	"qh" => "Qeynos Hills",
+	"hh" => "Highpass Hold",
+	"hhk" => "HighKeep",
+	"nfp" => "North Freeport",
+	"wfp" => "West Freeport",
+	"efp" => "East Freeport",
+	"runnyeye" => "Clan RunnyEye",
+	"wk" => "West Karana",
+	"nk" => "North Karana",
+	"sk" => "South Karana",
+	"ek" => "East Karana",
+	"xorbb" => "Gorge of King Xorbb",
+	"bb" => "BlackBurrow",
+	"paw" => "Infected Paw",
+	"rivervale" => "Rivervale",
+	"kith" => "Kithicor Forest",
+	"wc" => "West Commonlands",
+	"ec" => "East Commonlands",
+	"erudin2" => "Erudin Palace",
+	"erudin" => "Erudin",
+	"nek" => "Nektulos Forest",
+	"lava" => "Lavastorm Mountains",
+	"halas" => "Halas",
+	"ef" => "Everfrost Peaks",
+	"sola" => "Solusek's Eye",
+	"solb" => "Nagafen's Lair",
+	"misty" => "Misty Thicket",
+	"nro" => "North Ro",
+	"sro" => "South Ro",
+	"befallen" => "Befallen",
+	"oasis" => "Oasis of Marr",
+	"tox" => "Toxxulia Forest",
+	"hole" => "The Ruins of Old Paineel",
+	"neriak" => "Neriak Foreign Quarter",
+	"neriak2" => "Neriak Commons",
+	"neriak3" => "Neriak Third Gate",
+	"najena" => "Najena",
+	"qc" => "Qeynos Catacombs",
+	"inno" => "Innothule Swamp",
+	"feerrott" => "The Feerrott",
+	"cazic" => "Cazic-Thule",
+	"oggok" => "Oggok",
+	"rathe" => "Mountains of Rathe",
+	"lakerathe" => "Lake Rathetear",
+	"grobb" => "Grobb",
+	"gfay" => "Greater Faydark",
+	"akanon" => "Ak'Anon",
+	"steamfont" => "Steamfont Mountains",
+	"lfay" => "Lesser Faydark",
+	"cb" => "Clan Crushbone",
+	"mm" => "Castle Mistmoore",
+	"kaladim" => "South Kaladim",
+	"felwithe" => "North Felwithe",
+	"felwithe2" => "South Felwithe",
+	"unrest" => "Estate of Unrest",
+	"kedge" => "Kedge Keep",
+	"uguk" => "Upper Guk",
+	"lguk" => "Lower Guk",
+	"kaladim2" => "North Kaladim",
+	"bbm" => "Butcherblock Mountains",
+	"oot" => "Ocean of Tears",
+	"dag" => "Dagnor's Cauldron",
+	"posky" => "Plane of Sky",
+	"pofear" => "Plane of Fear",
+	"perma" => "Permafrost Keep",
+	"kerra" => "Kerra Isle",
+	"paineel" => "Paineel",
+	"arena" => "The Arena",
+	"fob" => "The Field of Bone",
+	"warslik" => "Warsliks Wood",
+	"solrotemple" => "Temple of Solusek Ro",
+	"droga" => "Temple of Droga",
+	"wcab" => "West Cabilis",
+	"sonh" => "Swamp of No Hope",
+	"fv" => "Firiona Vie",
+	"loio" => "Lake of Ill Omen",
+	"dl" => "Dreadlands",
+	"bw" => "Burning Woods",
+	"kaesora" => "Kaesora",
+	"seb" => "Old Sebilis",
+	"com" => "City of Mist",
+	"skyfire" => "Skyfire Mountains",
+	"fm" => "Frontier Mountains",
+	"ot" => "The Overthere",
+	"ej" => "The Emerald Jungle",
+	"tt" => "Trakanon's Teeth",
+	"td" => "Timorous Deep",
+	"kurn" => "Kurn's Tower",
+	"erud" => "Erud's Crossing",
+	"stonebrunt" => "Stonebrunt Mountains",
+	"warrens" => "The Warrens",
+	"kc" => "Karnor's Castle",
+	"chardok" => "Chardok",
+	"dalnir" => "Dalnir",
+	"hs" => "Howling Stones",
+	"ecab" => "East Cabilis",
+	"nurga" => "Mines of Nurga",
+	"vp" => "Veeshan's Peak",
+	"iceclad" => "Iceclad Ocean",
+	"tofs" => "Tower of Frozen Shadow",
+	"velk" => "Velketor's Labyrinth",
+	"kael" => "Kael Drakkal",
+	"ss" => "Skyshrine",
+	"thurg" => "Thurgadin",
+	"ew" => "Eastern Wastes",
+	"cs" => "Cobalt Scar",
+	"gd" => "Great Divide",
+	"wl" => "The Wakening Land",
+	"ww" => "Western Wastes",
+	"cc" => "Crystal Caverns",
+	"dn" => "Dragon Necropolis",
+	"tov" => "Temple of Veeshan",
+	"sg" => "Siren's Grotto",
+	"pom" => "Plane of Mischief",
+	"pog" => "Plane of Growth",
+	"st" => "Sleeper's Tomb",
+	"icewell" => "Icewell Keep",
+	"shadow" => "Shadow Haven",
+	"baz" => "The Bazaar",
+	"nex" => "The Nexus",
+	"echo" => "Echo Caverns",
+	"ac" => "Acrylia Caverns",
+	"sv" => "Shar Vahl",
+	"pc" => "Paludal Caverns",
+	"fg" => "Fungus Grove",
+	"vt" => "Vex Thal",
+	"seru" => "Sanctus Seru",
+	"katta" => "Katta Castellum",
+	"neth" => "Netherbian Lair",
+	"ssra" => "Ssraeshza Temple",
+	"grieg" => "Grieg's End",
+	"deep" => "The Deep",
+	"shade" => "Shadeweaver's Thicket",
+	"hollow" => "Hollowshade Moor",
+	"gf" => "Grimling Forest",
+	"marus" => "Marus Seru",
+	"mons" => "Mons Letalis",
+	"ts" => "The Twilight Sea",
+	"grey" => "The Grey",
+	"tene" => "The Tenebrous Mountains",
+	"me" => "The Maiden's Eye",
+	"dsp" => "Dawnshroud Peaks",
+	"sd" => "The Scarlet Desert",
+	"up" => "The Umbral Plains",
+	"ar" => "Akheva Ruins",
+	"jpf" => "The Jaggedpine Forest",
+	"poh" => "Plane of Hate",
+	"cod" => "Ruins of Lxanvom",
+	"poj" => "Plane of Justice",
+	"pok" => "Plane of Knowledge",
+	"pot" => "Plane of Tranquility",
+	"pon" => "Plane of Nightmare",
+	"pod" => "Plane of Disease",
+	"poi" => "Plane of Innovation",
+	"potorment" => "Plane of Torment",
+	"pov" => "Plane of Valor",
+	"bot" => "Torden, The Bastion of Thunder",
+	"pos" => "Plane of Storms",
+	"hoh" => "Halls of Honor",
+	"solro" => "Solusek Ro's Tower",
+	"potactics" => "Drunder, Fortress of Zek",
+	"poa" => "Eryslai, the Kingdom of Wind",
+	"pow" => "Reef of Coirnav",
+	"pof" => "Doomfire, The Burning Lands",
+	"poe" => "Vegarlson, The Earthen Badlands",
+	"potime" => "Plane of Time A",
+	"hohb" => "Temple of Marr",
+	"ponb" => "Lair of Terris Thule",
+	"poeb" => "Stronghold of the Twelve",
+	"potimeb" => "Plane of Time B"
+);
+
+
+
+sub kill_thread {
+	print "Detected that $PID has quit. Killing this thread...\n";
+	threads->detach();
+	threads->exit();
+}
+
+sub server {
+	my ($server_socket, $server_client_socket);
+	my ($peer_address, $peer_port);
+	my $server_data;
+
+	$server_socket = new IO::Socket::INET (
+		LocalHost => '127.0.0.1',
+		LocalPort => '10000',
+		Proto => 'tcp',
+		Listen => 5,
+		Reuse => 1
+	) or die "Error in server socket creation: $!\n";
+
+	while () {
+		$server_client_socket = $server_socket->accept();
+		$peer_address = $server_client_socket->peerhost();
+		$peer_port = $server_client_socket->peerport();
+		$server_data = <$server_client_socket>;
+		if ($server_data =~ /(\d+) (.+)/) {
+			$CommandToPass = $2;
+			system "kill -s SIGINT $1";
+		} else {
+			print "Error: Server recieved data that wasn't in the correct format.\n";
+			print "Data: $server_data";
+		}
+	}
+}
+
+sub advance {
+	$_[0] =~ /0x(.+)/;
+	my $AdvanceLocation = $1;
+	$AdvanceLocation =~ tr/A-Z/a-z/; # Change letters to lowercase
+	print $socket "dis 1\r\n";
+	print $socket "dis 2\r\n";
+	while () {
+		print $socket "adv *$_[0]\r\n";
+		if ($data = <$socket>) {
+			# do nothing
+		} else {
+			kill_thread;
+		}
+		print "\tPID $PID --- $data"; # For debugging
+		if ($data =~ /$AdvanceLocation/) {
+			last;
+		} elsif ($data =~ /in main\(\)/) {
+			kill_thread;
+		}
+	}
+	print "Finished advancing.\n";
+	print $socket "en 1\r\n";
+	print $socket "en 2\r\n";
+}
+
+sub get_my_location {
+	print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x48\r\n";
+	<$socket> =~ /:\s+(.+)$/;
+	$MyX = $1;
+	$MyX = unpack "f", pack "L", hex($MyX);
+	print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x4C\r\n";
+	<$socket> =~ /:\s+(.+)$/;
+	$MyY = $1;
+	$MyY = unpack "f", pack "L", hex($MyY);
+	print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x50\r\n";
+	<$socket> =~ /:\s+(.+)$/;
+	$MyZ = $1;
+	$MyZ = unpack "f", pack "L", hex($MyZ);
+}
+
+sub get_target_location {
+	print $socket "x/x *" . ADDRESS_TargetPlayer . " + 0x48\r\n";
+	<$socket> =~ /:\s+0x(.+)$/;
+	$TargetX = $1;
+	$TargetX = unpack "f", pack "L", hex($TargetX);
+	print $socket "x/x *" . ADDRESS_TargetPlayer . " + 0x4C\r\n";
+	<$socket> =~ /:\s+0x(.+)$/;
+	$TargetY = $1;
+	$TargetY = unpack "f", pack "L", hex($TargetY);
+	print $socket "x/x *" . ADDRESS_TargetPlayer . " + 0x50\r\n";
+	<$socket> =~ /:\s+0x(.+)$/;
+	$TargetZ = $1;
+	$TargetZ = unpack "f", pack "L", hex($TargetZ);
+}
+
+sub get_target_name {
+	print $socket "x/s *" . ADDRESS_TargetPlayer . " + 1\r\n";
+	<$socket> =~ /:\s+"(.+)"/;
+	$TargetName = $1;
+}
+
+sub get_current_zone {
+	print $socket "x/x " . ADDRESS_CurrentZone . "\r\n";
+	<$socket> =~ /:\s+(.+)$/;
+	$CurrentZone = hex($1);
+}
+
+sub target_check {
+	print $socket "x/x " . ADDRESS_TargetPlayer . "\r\n";
+	<$socket> =~ /:\s+(.+)$/;
+	if ($1 eq "0x00000000") {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub target_corpse_check {
+	print $socket "x/x *" . ADDRESS_TargetPlayer . " + 0xA8 \r\n";
+	<$socket> =~ /:\s+0x.......(.)/;
+	if ($1 eq "2") {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub load_string {
+	print $socket "set *(char *) 0x1900000 = 0x2D\r\n";
+	print $socket "set *(char *) 0x1900001 = 0x2D\r\n";
+	print $socket "set *(char *) 0x1900002 = 0x3E\r\n";
+	print $socket "set *(char *) 0x1900003 = 0x20\r\n";
+	my @stringArray = split //, $_[0];
+	my $StringAddress = 26214404; # 0x1900004
+	foreach (@stringArray) {
+		$_ =~ s/(.)/sprintf("%X",ord($1))/eg;
+		print $socket sprintf("set *(char *) 0x%X = 0x%s\r\n", $StringAddress, $_);
+		$StringAddress++;
+	}
+	print $socket sprintf("set *(char *) 0x%X = 0x00\r\n", $StringAddress);
+}
+
+sub eq_print {
+	my $String = shift;
+	my $TypeOfPrint = shift;
+	$String =~ s/`/\\`/;
+	if (!$TypeOfPrint) {
+		system "./load_string $PID \"--> $String\"";
+		print $socket "call (void) _ZN10CEverQuest8dsp_chatEPKcsb(0, 0x1900000, 0x113, 1)\r\n";
+	} elsif ($TypeOfPrint == 1) {
+		system "./load_string $PID \"$String\"";
+		print $socket "call (void) _ZN10CEverQuest8dsp_chatEPKcsb(0, 0x1900000, 0x119, 1)\r\n";
+	} elsif ($TypeOfPrint == 2) {
+		system "./load_string $PID \"------> $String\"";
+		print $socket "call (void) _ZN10CEverQuest8dsp_chatEPKcsb(0, 0x1900000, 0x113, 1)\r\n";
+	}
+	while (<$socket>) { # Bypass breakpoint #2
+		if (/Breakpoint 2, /) {
+			print $socket "c\r\n";
+			last;
+		}
+	}
+}
+
+sub face {
+	# Change to 512 degree format
+	$_[0] *= 1.42222222222;
+	# Convert to hex
+	$_[0] = sprintf("%lx", unpack "L", pack "f", $_[0]);
+	# Find heading location
+	print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x54\r\n";
+	<$socket> =~ /0x(.+):/;
+	# Set heading
+	print $socket "set *(int *) 0x$1 = 0x$_[0]\r\n";
+}
+
+sub warp {
+	# Get arguments
+	my $WarpX = $_[0];
+	my $WarpY = $_[1];
+	my $WarpZ = $_[2];
+	# Validate input
+	if (!looks_like_number($WarpX)) {
+		eq_print("$WarpX is not a number.");
+		return;
+	} elsif (!looks_like_number($WarpY)) {
+		eq_print("$WarpY is not a number.");
+		return;
+	} elsif (!looks_like_number($WarpZ)) {
+		eq_print("$WarpZ is not a number.");
+		return;
+	}
+	# Get old safe spot
+	`./safe_spot_get $PID` =~ /(.+) (.+) (.+)/;
+	my $SafeX = $1;
+	my $SafeY = $2;
+	my $SafeZ = $3;
+	# Set new safe spot
+	system "./safe_spot_set $PID $WarpX $WarpY $WarpZ";
+	# Succor
+	print $socket "call (void) _ZN8CDisplay27MoveLocalPlayerToSafeCoordsEv()\r\n";
+	# Set old safe spot back
+	system "./safe_spot_set $PID $SafeX $SafeY $SafeZ";
+}
+
+sub warp_shortcut {
+	my $Shortcut = shift;
+	if ($Shortcut =~ /mm/) {
+		warp("-210", "20", "-79");
+		eq_print("Warping to the Mistmoore safe spot.");
+	} else {
+		eq_print("$Shortcut is not a valid shortcut.");
+	}
+}
+
+sub move {
+	# Get arguments
+	my $WarpX = $_[0];
+	my $WarpY = $_[1];
+	my $WarpZ = $_[2];
+	# Double negatives cancel each other out
+	$WarpX = substr($WarpX, 2) if ($WarpX =~ /--/);
+	$WarpY = substr($WarpY, 2) if ($WarpY =~ /--/);
+	$WarpZ = substr($WarpZ, 2) if ($WarpZ =~ /--/);
+	# Get my location
+	get_my_location;
+	# Move X
+	if ($WarpX eq "-") {
+		$WarpX = $MyX;
+	} else {
+		if (looks_like_number($WarpX)) {
+			$MyX += $WarpX;
+		} else {
+			eq_print("$WarpX is not a number.");
+			return;
+		}
+	}
+	# Move Y
+	if ($WarpY eq "-") {
+		$WarpY = $MyY;
+	} else {
+		if (looks_like_number($WarpY)) {
+			$MyY += $WarpY;
+		} else {
+			eq_print("$WarpY is not a number.");
+			return;
+		}
+	}
+	# Move Z
+	if ($WarpZ eq "-") {
+		$WarpZ = $MyZ;
+	} else {
+		if (looks_like_number($WarpZ)) {
+			$MyZ += $WarpZ;
+		} else {
+			eq_print("$WarpZ is not a number.");
+			return;
+		}
+	}
+	warp($MyX, $MyY, $MyZ);
+	# Round to 2 decimals
+	$MyX = sprintf("%.2f", $MyX); 
+	$MyY = sprintf("%.2f", $MyY);
+	$MyZ = sprintf("%.2f", $MyZ);	
+	if ($_[3] eq "n") {
+		eq_print("Moving north to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "s") {
+		eq_print("Moving south to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "w") {
+		eq_print("Moving west to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "e") {
+		eq_print("Moving east to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "u") {
+		eq_print("Moving up to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "d") {
+		eq_print("Moving down to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "nw") {
+		eq_print("Moving northwest to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "ne") {
+		eq_print("Moving northeast to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "sw") {
+		eq_print("Moving southwest to ($MyX, $MyY, $MyZ).");
+	} elsif ($_[3] eq "se") {
+		eq_print("Moving southeast to ($MyX, $MyY, $MyZ).");
+	}
+}
+
+sub bfs { # Breadth first search algorithm
+	my $start = $_[0];
+	my $end = $_[1];
+	my @queue = ($start);
+	my %route = ($start => [$start]); 
+	while (my $node = shift @queue) {
+		foreach my $zone (@{$ZoneConnection{$node}}) {
+			if (!$route{$zone}) {
+				$route{$zone} = [ @{$route{$node}}, $zone ];
+				return $route{$zone} if ($zone eq $end);
+				push @queue, $zone;
+			}
+		}
+	}
+}
+
+sub zone {
+	my $DestinationZone = shift @ShortestPathList; # Load the first element and remove it
+	system "./load_string $PID \"$DestinationZone\"";
+	print $socket "call (void) _Z13do_switchzoneP8EQPlayerPc(" . ADDRESS_LocalPC . ", 0x1900000)\r\n";
+}
+
+sub loot_all {
+	for (my $i = 20; $i >= 0; $i--) {
+		print $socket "call (void) _ZN8CLootWnd15RequestLootSlotEib(*" . ADDRESS_LootWnd . ", $i, 1)\r\n";
+	}
+	for (21..29) {
+		print $socket "call (void) _ZN8CLootWnd15RequestLootSlotEib(*" . ADDRESS_LootWnd . ", $_, 1)\r\n";
+	}
+	print $socket "call (void) _ZN8CLootWnd10DeactivateEb(*" . ADDRESS_LootWnd . ", 1)\r\n";
+}
+
+sub init {
+	# Get arguments
+	$PID = shift;
+	my $PortNumber = (shift) + 10000;
+	if (shift) {
+		print "Initialized. Sleeping 10 seconds.\n";
+		sleep 10;
+		print "Proceeding.\n";
+	}
+	# Check to see if the EQ process still exists
+	if (`ps $PID | grep -v COMMAND`) {
+		# do nothing
+	} else {
+		print "PID $PID exited before the hook could start.\n";
+		return;
+	}
+
+	# Attach to the EQ process
+	system "./nc -l -p $PortNumber -e \"./gdb --pid=$PID\" &";
+	sleep 1;
+	$socket = new IO::Socket::INET (
+		PeerHost => '127.0.0.1',
+		PeerPort => $PortNumber,
+		Proto => 'tcp',
+	) or die "error: $!\n";
+	# Set GDB settings
+	print $socket "set width 0\r\n";
+	print $socket "set height 0\r\n";
+	# Set up command hook
+	print $socket "b *" . ADDRESS_CommandHook . "\r\n";
+	# Set up chat hook
+	print $socket "b *" . ADDRESS_ChatHook . "\r\n";
+	print $socket "commands 2\r\n";
+	print $socket "x/s \$edi\r\n";
+	print $socket "end\r\n";
+	# Set up sit/stand hook
+	#print $socket "b *" . ADDRESS_SitStandHook . "\r\n";
+	#print $socket "dis 3\r\n";
+	# Set up movement update hook
+	#print $socket "b *0x29A622\r\n";
+	#print $socket "dis 3\r\n";
+	# Set up spell cast hook
+	#print $socket "b *" . ADDRESS_CastingWndDeactivate . "\r\n";
+	#print $socket "dis 3\r\n";
+	# Set up rez hook
+	#print $socket "b *0xD50A0\r\n";
+	# Clear buffer
+	while (<$socket>) {
+		last if (/Breakpoint 2 at/);
+	}
+	# Wait until the client is ready
+	advance(ADDRESS_DoPassageOfTime);
+	# Get character name
+	print $socket "x/s *" . ADDRESS_LocalPC . " + 2\r\n";
+	while (<$socket>) {
+		if (/:\s+"(.+)"/) {
+			$CharacterName = $1;
+			last;
+		}
+	}
+	$temp = localtime;
+	$temp =~ /(\d+:\d+:\d+)/;
+	print "ZamielQuest started for $CharacterName (PID $PID) @ $1.\n";
+	# Disable under world check
+	print $socket "set *(int *) " . ADDRESS_CheckForUnderWorld . " = 0x90909090\r\n";
+	$temp = hex(ADDRESS_CheckForUnderWorld) + 4;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(short *) 0x$temp = 0x9090\r\n";
+	$temp = hex(ADDRESS_CheckForUnderWorld) + 18;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(int *) 0x$temp = 0x90909090\r\n";
+	$temp = hex(ADDRESS_CheckForUnderWorld) + 22;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(short *) 0x$temp = 0x9090\r\n";
+	# Always have ultravision
+	print $socket "set *(char *) " . ADDRESS_Ultravision . " = 0x00\r\n";
+	# Always have see-invis
+	print $socket "set *(int *) " . ADDRESS_SeeInvis . " = 0x899001B0\r\n";
+	# Disable fall damage
+	print $socket "set *(int *) " . ADDRESS_FallDamage . " = 0x90909090\r\n";
+	$temp = hex(ADDRESS_FallDamage) + 4;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(char *) 0x$temp = 0x90\r\n";
+	# Disable environment damage
+	print $socket "set *(int *) " . ADDRESS_EnvDamage . " = 0x90909090\r\n";
+	$temp = hex(ADDRESS_EnvDamage) + 4;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(char *) 0x$temp = 0x90\r\n";
+	# Always have enduring breath
+	print $socket "set *(char *) " . ADDRESS_EnduringBreath . " = 0x90\r\n";
+	# Always have an accurate compass (sometimes requires reloading UI)
+	print $socket "set *(int *) " . ADDRESS_CompassFix . " = 0x90909090\r\n";
+	$temp = hex(ADDRESS_CompassFix) + 4;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(short *) 0x$temp = 0x9090\r\n";
+	# Don't get stunned
+	print $socket "set *(int *) " . ADDRESS_Stun . " = 0x90909090\r\n";
+	$temp = hex(ADDRESS_Stun) + 4;
+	$temp = sprintf("%lx", unpack "L", pack "i", $temp);
+	print $socket "set *(char *) 0x$temp = 0x90\r\n";
+	# Don't get pushed back by melee
+	print $socket "set *(int *) 0x23CE87 = 0x90909090\r\n";
+	print $socket "set *(char *) 0x23CE8B = 0x90\r\n";
+	print $socket "set *(int *) 0x23CEB3 = 0x90909090\r\n";
+	print $socket "set *(char *) 0x23CEB7 = 0x90\r\n";
+	print $socket "set *(int *) 0x23CEE4 = 0x90909090\r\n";
+	print $socket "set *(char *) 0x23CEE8 = 0x90\r\n";
+	# Memorize spells instantly
+	print $socket "set *(char *) 0x2CECE1 = 0x01\r\n";
+	# Scribe spells instantly
+	print $socket "set *(char *) 0x2CF038 = 0x01\r\n";
+	# Click off debuffs (only works client-side)
+	print $socket "set *(short *) 0x1D8F4D = 0x9090\r\n";
+
+	# Finished
+	eq_print("ZamielQuest initialized.");
+	print $socket "c\r\n";
+
+	while (<$socket>) {
+		if (/Breakpoint 1, /) { # An EQ command was issued
+			$SuppressCommand = 1;
+			print $socket "x/s \$ebx\r\n";
+			if ($GDBInterrupted) {
+				<$socket> for (1..4);
+			}
+			$data = <$socket>;
+			# /wr - Wait for rez and automatically loot the corpse
+			#} elsif ($data =~ /"\/wr"/) {
+			#	$WaitingForRez = 1;
+			#	eq_print("Taking the next rez...");
+			# /debug - For testing
+			if ($data =~ /"\/debug"/) {
+
+				# Check for target
+				if (target_check) {
+
+					# Save my current location
+					#get_my_location;
+					#$GhostX = $MyX;
+					#$GhostY = $MyY;
+					#$GhostZ = $MyZ;
+
+					# Warp to target
+					get_target_location;
+					warp($TargetX, $TargetY, $TargetZ);
+
+					# Update location
+					print $socket "call (void) _Z12send_messagePP12connection_tjPvjj(0x645914, 0x40F3, 0xBFFFF6CF, 0x0F, 1)\r\n";
+
+					# Flying Kick
+					print $socket "call (void) _ZN12EQ_Character8UseSkillEhP8EQPlayer(*0x4CCCCC, 0x1A, 0)\r\n";
+
+					# Warp back
+					#warp($GhostX, $GhostY, $GhostZ);
+
+					# Update location
+					print $socket "call (void) _Z12send_messagePP12connection_tjPvjj(0x645914, 0x40F3, 0xBFFFF6CF, 0x0F, 1)\r\n";
+
+					eq_print("Ghost-kill complete.");
+				} else {
+					eq_print("No target!");
+				}
+
+			# /echo - For scripts and logging
+			} elsif ($data =~ /"\/echo (.+)"/) {
+				eq_print("$1");
+			# /a X - Tell all instances to do X
+			} elsif ($data =~ /"\/a (.+)"/) {
+				$CommandToPass = "$1";
+				$CommandToAll = 1;
+				eq_print("Telling everyone to \"$1\"...");
+			# /ignore - Respond to /a commands
+			} elsif ($data =~ /"\/ignore"/) {
+				if ($Ignore) {
+					$Ignore = 0;
+					eq_print("Will now respond to /a commands.");
+				} else {
+					$Ignore = 1;
+					eq_print("Will now ignore /a commands.");
+				}
+			# / - Who PC
+			} elsif ($data =~ /"\/"/) {
+				foreach (`./who $PID pc`) {
+					chomp $_;
+					eq_print("$_", 1);
+				}
+			# / X - Who X
+			} elsif ($data =~ /"\/ (.+)"/) {
+				if ($1 =~ /\ball\b/) {
+					$SuppressCommand = 0;
+				} else {
+					foreach (`./who $PID $1`) {
+						chomp $_;
+						eq_print("$_", 1);
+						$temp = 0;
+					}
+				}
+			# /whot - Who the current target
+			} elsif ($data =~ /"\/whot"/) {
+				foreach (`./who $PID target id`) {
+					chomp $_;
+					eq_print("$_", 1);
+					$temp = 0;
+				}
+			# /tar clear - Clear the current target
+			} elsif ($data =~ /"\/tar clear"/) {
+			print $socket "set *(int *) " . ADDRESS_TargetPlayer . " = 0\r\n";
+			eq_print("Target cleared.");
+			# /tar X - Target X
+			} elsif ($data =~ /"\/tar (.+)"/) {
+				$temp = $1;
+				$temp =~ s/id/ids/ if ($temp  =~ /\bid\b/);
+				$temp2 = `./who $PID address $temp`;
+				$temp3 = 1;
+				foreach ($temp2) {
+					if (/0x(........)/) {
+						print $socket "set *(int *) " . ADDRESS_TargetPlayer . " = 0x$1\r\n";
+						$temp2 =~ /0x........ (.+)/;
+						eq_print("Targeted: $1");
+						$temp3 = 0;
+						last;
+					}
+				}
+				if ($temp3) {
+					eq_print("Not found: $temp");
+				}
+			# /l - Loot all items on a corpse
+			} elsif ($data =~ /"\/l"/) {
+				loot_all;
+				eq_print("Looting all items from the corpse...");
+			# /f - Face the current target
+			} elsif ($data =~ /"\/f"/) {
+				if (target_check) {
+					# Calculate heading
+					get_my_location;
+					get_target_location;
+					$temp = atan2($TargetY - $MyY, $TargetX - $MyX) * 180 / pi;
+					$temp = 360 + $temp if ($temp < 0);
+					face($temp);
+					get_target_name;
+					eq_print("Facing $TargetName.");
+				}
+			# /f X - Face X heading
+			} elsif ($data =~ /"\/f (.+)"/) {
+				if (looks_like_number("$1")) { # Must quote $1 to avoid a looks_like_number bug
+					face("$1"); # Must quote $1 to avoid modification of a read-only value
+					eq_print("Facing heading $1.");
+				} else {
+					eq_print("$1 is not a number.");
+				}
+			# /g - Gate
+			} elsif ($data =~ /"\/g"/) {
+				system "./gate $PID";
+				eq_print("Gating...");
+			# /fa - Fade (zone in place)
+			} elsif ($data =~ /"\/fa"/) {
+				# Get current heading
+				print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x54\r\n";
+				<$socket> =~ /:\s+(.+)$/;
+				$Heading = unpack "f", pack "L", hex($1);
+				$Heading /= 1.42222222222;
+				# Get current zone
+				get_current_zone;
+				# Find bound zone ID location
+				print $socket "x/x *" . ADDRESS_LocalPC . " + 0xEC4\r\n";
+				<$socket> =~ /0x(.+):/;
+				# Set it to the current zone
+				print $socket "set *(int *) 0x$1 = $CurrentZone\r\n";
+				system "./gate $PID";
+				eq_print("Fading...");
+				$Fading = 1;
+			# /z X - Zone to X
+			} elsif ($data =~ /"\/z (.+)"/) {
+				$EndZone = $ZoneAlias{$1}; # Will become undefined if it doesn't match
+				if (defined $EndZone) {
+					get_current_zone;
+					$CurrentZone = $ZoneID{$CurrentZone};
+					if ($EndZone eq $CurrentZone) {
+						eq_print("You are already in $EndZone.");
+					} elsif ($EndZone eq "Ocean of Tears" or $EndZone eq "Erud's Crossing" or $EndZone eq "Timorous Deep") {
+						eq_print("Unfortunately, you have to zone to $EndZone using a boat.");
+					} elsif ($EndZone eq "Plane of Hate") {
+						eq_print("Unfortunately, you have to zone to $EndZone using a wizard teleport.");
+					} else {
+						warp("-32764.185547","-32764.185547","-32764.185547"); # Try to be sneaky
+						$ShortestPath = bfs($CurrentZone, $EndZone);
+						@ShortestPathList = ();
+						foreach (@$ShortestPath) {
+							push @ShortestPathList, $ZoneShortName{$_};
+						}
+						shift @ShortestPathList; # Remove the first element because it is the current zone
+						$Zoning = 1;
+						zone;
+						eq_print("Zoning to $EndZone. Please stand by.");
+					}
+				} else {
+					eq_print("$1 is not a zone alias.");
+				}
+			# /zs X - Zone special to X
+			} elsif ($data =~ /"\/zs (.+)"/) {
+				$EndZone = $ZoneAlias{$1}; # Will become undefined if it doesn't match
+				if (defined $EndZone) {
+					# Convert the name of the destination zone to hex
+					foreach (keys %ZoneID) {
+						if ($ZoneID{$_} eq $EndZone) {
+							$temp2 = $EndZone;
+							$EndZone = $_;
+							$EndZone = sprintf("0x%x", $EndZone);
+							last;
+						}
+					}
+					# Find bound zone ID location
+					print $socket "x/x *" . ADDRESS_LocalPC . " + 0xEC4\r\n";
+					<$socket> =~ /0x(.+):/;
+					# Set it to the new zone
+					print $socket "set *(int *) 0x$1 = $EndZone\r\n";
+					system "./gate $PID";
+					eq_print("Corpse-zoning to $temp2. Please stand by.");
+				} else {
+					eq_print("$1 is not a zone alias.");
+				}
+			# /sp - Display current speed
+			} elsif ($data =~ /"\/sp"/) {
+				print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x104\r\n";
+				<$socket> =~ /:\s+(.+)$/;
+				$temp = unpack "f", pack "L", hex($1);
+				$temp = sprintf("%.1f", $temp); # Round to 1 decimal
+				eq_print("Your current speed is $temp. (0.7 is the default.)");
+			# /sp off - Change speed to the default
+			} elsif ($data =~ /"\/sp off"/) {
+				# Convert it to hex
+				$temp = "0.7";
+				$temp = sprintf("%lx", unpack "L", pack "f", $temp);
+				# Find speed location
+				print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x104\r\n";
+				<$socket> =~ /0x(.+):/;
+				# Set it to the new value
+				print $socket "set *(int *) 0x$1 = 0x$temp\r\n";
+				eq_print("Your speed is now: 0.7 (the default)");
+			# /sp X - Change speed to X
+			} elsif ($data =~ /"\/sp (.+)"/) {
+				if (looks_like_number("$1")) {
+					# Convert it to hex
+					$temp = $1;
+					$temp = sprintf("%lx", unpack "L", pack "f", $temp);
+					# Find speed location
+					print $socket "x/x *" . ADDRESS_LocalPlayer . " + 0x104\r\n";
+					<$socket> =~ /0x(.+):/;
+					# Set it to the new value
+					print $socket "set *(int *) 0x$1 = 0x$temp\r\n";
+					$temp = unpack "f", pack "L", hex($temp);
+					$temp = sprintf("%.1f", $temp); # Round to 1 decimal
+					eq_print("Your speed is now: $temp");
+				} else {
+					eq_print("$1 is not a number.");
+				}
+			# /fly - Toggle flying
+			} elsif ($data =~ /"\/fly"/) {
+				#print $socket "x/x 0x2CB459\r\n";
+				#if (<$socket> =~ /:\s+0xf83f850f$/) {
+					print $socket "set *(int *) 0x2CB459 = 0xFFF83FE9\r\n";
+					print $socket "set *(short *) 0x2CB45D = 0x90FF\r\n";
+					eq_print("Flying enabled.");
+				#} else {
+				#	print $socket "set *(int *) 0x2CB459 = 0xF83F850F\r\n";
+				#	print $socket "set *(short *) 0x2CB45D = 0xFFFF\r\n";
+				#	eq_print("Flying disabled.");
+				#}
+			# /clip - Toggle clipping through walls
+			} elsif ($data =~ /"\/clip"/) {
+				print $socket "x/x 0x2366AD\r\n";
+				if (<$socket> =~ /:\s+0x0fab840f$/) {
+					print $socket "set *(int *) 0x2366AD = 0x90909090\r\n";
+					print $socket "set *(short *) 0x2366B1 = 0x9090\r\n";
+					eq_print("Clipping enabled.");
+				} else {
+					print $socket "set *(int *) 0x2366AD = 0x0FAB840F\r\n";
+					print $socket "set *(short *) 0x2366B1 = 0x0000\r\n";
+					eq_print("Clipping disabled.");
+				}
+			# /ws (.+) - Warp to shortcut
+			} elsif ($data =~ /"\/ws (.+)"/) {
+				warp_shortcut("$1");
+			# /ws - Warp to the safe spot
+			} elsif ($data =~ /"\/ws"/) {
+				print $socket "call (void) _ZN8CDisplay27MoveLocalPlayerToSafeCoordsEv()\r\n";
+				eq_print("Warping to the safe spot.");
+			# /wu - Warp under the world
+			} elsif ($data =~ /"\/wu"/) {
+				warp("-32764.185547","-32764.185547","-32764.185547");
+				eq_print("Warping under the world.");
+			# /wt - Warp to the current target
+			} elsif ($data =~ /"\/wt"/) {
+				if (target_check) {
+					get_target_location;
+					warp($TargetX, $TargetY, $TargetZ);
+					# Round to 2 decimals
+					$TargetX = sprintf("%.2f", $TargetX); 
+					$TargetY = sprintf("%.2f", $TargetY);
+					$TargetZ = sprintf("%.2f", $TargetZ);
+					get_target_name;
+					eq_print("Warping to $TargetName: ($TargetX, $TargetY, $TargetZ)");
+				} else {
+					eq_print("No target!");
+				}
+			# /w X Y Z - Warp to X, Y, Z
+			} elsif ($data =~ /"\/w (.+) (.+) (.+)"/) {
+				warp("$1", "$2", "$3");
+				# Round to 2 decimals
+				$TargetX = sprintf("%.2f", $1); 
+				$TargetY = sprintf("%.2f", $2);
+				$TargetZ = sprintf("%.2f", $3);
+				eq_print("Warping to: ($TargetX, $TargetY, $TargetZ)")	
+			# /w X Y - Warp to X, Y
+			} elsif ($data =~ /"\/w (.+) (.+)"/) {
+				get_my_location;
+				warp("$1", "$2", $MyZ);
+				$MyZ = sprintf("%.2f", $MyZ); # Round to 2 decimals
+				eq_print("Warping to: ($1, $2, $MyZ)")	
+			# /wtm - Warp all to me
+			} elsif ($data =~ /"\/wtm"/) {
+				get_my_location;
+				$CommandToPass = "/w $MyX $MyY $MyZ";
+				$CommandToAll = 1;
+				eq_print("Telling everyone to warp to me...");
+			# /n - Warp north by 100
+			} elsif ($data =~ /"\/n"/) {
+				move("100", "-", "-", "n")
+			# /n X - Warp north by X
+			} elsif ($data =~ /"\/n (.+)"/) {
+				move("$1", "-", "-", "n");
+			# /s - Warp south
+			} elsif ($data =~ /"\/s"/) {
+				move("-100", "-", "-", "s")
+			# /s X - Warp south by X
+			} elsif ($data =~ /"\/s (.+)"/) {
+				move("-$1", "-", "-", "s")
+			# /w - Warp west
+			} elsif ($data =~ /"\/w"/) {
+				move("-", "100", "-", "w")
+			# /w X - Warp west by X
+			} elsif ($data =~ /"\/w (.+)"/) {
+				move("-", "$1", "-", "w")
+			# /e - Warp east
+			} elsif ($data =~ /"\/e"/) {
+				move("-", "-100", "-", "e")
+			# /e X - Warp east by X
+			} elsif ($data =~ /"\/e (.+)"/) {
+				move("-", "-$1", "-", "e")
+			# /u - Warp up
+			} elsif ($data =~ /"\/u"/) {
+				move("-", "-", "100", "u")
+			# /u X - Warp up by X
+			} elsif ($data =~ /"\/u (.+)"/) {
+				move("-", "-", "$1", "u")
+			# /d - Warp down
+			} elsif ($data =~ /"\/d"/) {
+				move("-", "-", "-100", "d")
+			# /d X - Warp down by X
+			} elsif ($data =~ /"\/d (.+)"/) {
+				move("-", "-", "-$1", "d")
+			# /nw - Warp northwest
+			} elsif ($data =~ /"\/nw"/) {
+				move("50", "50", "-", "nw")
+			# /nw - Warp northwest by X
+			} elsif ($data =~ /"\/nw (.+)"/) {
+				$temp = $1 / 2;
+				move("$temp", "$temp", "-", "nw")
+			# /ne - Warp northeast
+			} elsif ($data =~ /"\/ne"/) {
+				move("50", "-50", "-", "ne")
+			# /ne X - Warp northeast by X
+			} elsif ($data =~ /"\/ne (.+)"/) {
+				$temp = $1 / 2;
+				move("$temp", "-$temp", "-", "ne")
+			# /sw - Warp southwest
+			} elsif ($data =~ /"\/sw"/) {
+				move("-50", "50", "-", "sw")
+			# /sw X - Warp southwest by X
+			} elsif ($data =~ /"\/sw (.+)"/) {
+				$temp = $1 / 2;
+				move("-$temp", "$temp", "-", "sw")
+			# /se - Warp southeast
+			} elsif ($data =~ /"\/se"/) {
+				move("-50", "-50", "-", "se")
+			# /se X - Warp southeast by X
+			} elsif ($data =~ /"\/se (.+)"/) {
+				$temp = $1 / 2;
+				move("-$temp", "-$temp", "-", "se")
+			# /cd off - Corpse drag stop
+			} elsif ($data =~ /"\/cd off"/) {
+				if (@CorpseDragging) {
+					@CorpseDragging = ();
+					foreach (`ps auwx | grep -v grep | grep "./corpseDrag.pl $PID" | awk '{print \$2}'`) {
+						chomp $_;
+						system "kill $_";
+					}
+					eq_print("Dragging stopped.");
+				} else {
+					eq_print("You weren't dragging any corpses...");
+				}
+			# /cd - Corpse drag
+			} elsif ($data =~ /"\/cd"/) {
+				$temp = 0;
+				if (target_check) {
+					if (target_corpse_check) {
+						get_target_name;
+						$temp = $TargetName;
+					} else {
+						$temp = "${CharacterName}'s corpse0";
+					}
+				} else {
+					$temp = "${CharacterName}'s corpse0";
+				}
+
+				# Check to see if it's already in the list
+				$temp2 = 0;
+				foreach (@CorpseDragging) {
+					if ($_ eq $temp) {
+						$temp2 = 1;
+					}
+				}
+				if ($temp2) {
+					eq_print("You are already dragging $temp.");
+				} else {
+					# Stop previous dragging
+					foreach (`ps auwx | grep -v grep | grep "./corpseDrag.pl $PID" | awk '{print \$2}'`) {
+						chomp $_;
+						system "kill $_";
+					}
+					# Start new dragging
+					push @CorpseDragging, $temp;
+					$temp3 = "./corpseDrag.pl $PID";
+					foreach (@CorpseDragging) {
+						$temp3 = sprintf("%s \"%s\"", $temp3, $_);
+					}
+					system "$temp3 &";
+					eq_print("Currently dragging:");
+					for (my $i = 0; $i < scalar @CorpseDragging; $i++) {
+						eq_print("$i - $CorpseDragging[$i]", 2);
+					}
+				}
+			# /corpsedrag - Drag a specific corpse
+			} elsif ($data =~ /"\/corpsedrag (.+)"/) {
+				system "./load_string $PID \"$1\"";
+				print $socket "call (void) _Z12send_messagePP12connection_tjPvjj(0x645914, 0x40C5, 0x1900000, 0x98, 1)\r\n";
+			# /ghost - Ghost
+			} elsif ($data =~ /"\/ghost"/) {
+				print $socket "x/x 0x29A622\r\n";
+				if (<$socket> =~ /:\s+0x8d8b5575$/) {
+					print $socket "set *(short *) 0x29A622 = 0x9090\r\n";
+					eq_print("Ghosting enabled.");
+				} else {
+					print $socket "set *(short *) 0x29A622 = 0x5575\r\n";
+					eq_print("Ghosting disabled.");
+				}
+			# /sits - Sit stick
+			#} elsif ($data =~ /"\/sits"/) {
+			#	if ($SitSticking) {
+			#		print $socket "dis 3\r\n";
+			#		print $socket "call (void) _ZN8EQPlayer14ChangePositionEh(*" . ADDRESS_LocalPlayer . ", 0x64)\r\n";
+			#		eq_print("Sit sticking disabled.");
+			#		$SitSticking = 0;
+			#	} else {
+			#		print $socket "call (void) _ZN8EQPlayer14ChangePositionEh(*" . ADDRESS_LocalPlayer . ", 0x6E)\r\n";
+			#		print $socket "en 3\r\n";
+			#		eq_print("Sit sticking enabled.");
+			#		$SitSticking = 1;
+			#	}
+			# /mac X - Begin the specified macro
+			#} elsif ($data =~ /"\/mac (.+)"/) {
+			#	if (-e "./$1.pl") {
+			#		system "kill $MacroOn" if ($MacroOn);
+			#		$MacroOn = open2(undef, undef, "./$1.pl $PID");
+			#		eq_print("Started $1.");
+			#	} else {
+			#		eq_print("$1.pl does not exist in the ZamielQuest directory!");
+			#	}
+			# /end - End the runnig macro
+			#} elsif ($data =~ /"\/end"/) {
+			#	if ($MacroOn) {
+			#		system "kill $MacroOn";
+			#		$MacroOn = 0;
+			#		eq_print("Ended the macro.");
+			#	} else {
+			#		eq_print("You weren't running a macro!");						
+			#	}
+			# The player entered a normal EverQuest command
+			} else {
+				$SuppressCommand = 0;
+			}
+
+			# Supress the EQ error message for the command
+			if ($SuppressCommand) {
+				print $socket "set \$eip = " . ADDRESS_CommandHookEnd . "\r\n";
+			}
+			print $socket "c\r\n";
+			if ($GDBInterrupted) {
+				$GDBInterrupted = 0;
+				print $socket "c\r\n";
+			}
+		} elsif (/Breakpoint 2, /) { # A line of chat arrived
+			$data = <$socket>;
+			if ($data =~ /"You have entered /) {
+				if ($Fading) {
+					face($Heading);
+					$Fading = 0;
+				} elsif ($Zoning) {
+					if (@ShortestPathList) {
+						advance(ADDRESS_SetupEQPlayers);
+						zone;
+					} else {
+						warp("-32764.185547","-32764.185547","-32764.185547"); # Anti-train
+						$Zoning = 0;
+					}
+				#} elsif ($WaitingForRez == 2) {
+				#	advance_into_zone;
+				#	system("./target $PID $CharacterName corpse");
+				#	print $socket "call (void) _ZN10CEverQuest10LootCorpseEP8EQPlayeri(*0x5068CC, *0x4FE588)\r\n";
+				#	pause 2 seconds, look into EqGetTime @ 0x002223be (would add a 4th breakpoint)
+				#	loot_all;
+				#	$WaitingForRez = 0;
+				}
+			#} elsif ($data =~ /"You begin casting /) {
+			#	&get_my_location;
+			#	$CastingX = $MyX;
+			#	$CastingY = $MyY;
+			#	$CastingZ = $MyZ;
+			#	print $socket "en 3\r\n";
+			}
+			print $socket "c\r\n";
+		#} elsif (/Breakpoint 3, /) { # We need to remain sitting
+		#	print $socket "set \$ebx = 0x6E\r\n";
+		#	print $socket "c\r\n";
+		#} elsif (/Breakpoint 3, /) { # We have reached the sending of the movement packet
+		#	if (!$GhostKill) { # Let a movement packet be sent
+		#		$GhostKill = 1;
+		#	} else { # 1 movement packet has been sent
+		#		#print $socket "call (void) _ZN12EQ_Character8UseSkillEhP8EQPlayer(*0x4FE58C, 0x1A, 0)\r\n"; # Flying Kick
+		#		#warp($GhostX, $GhostY, $GhostZ);
+		#		print $socket "set *(short *) 0x29A622 = 0x9090\r\n";
+		#		print $socket "dis 3\r\n";
+		#		print "done\n";
+		#		$GhostKill = 0;
+		#	}
+		#	print $socket "c\r\n";
+		#} elsif (/Breakpoint 3, /) { # Rez arrived
+		#	if ($WaitingForRez == 1) {
+		#		$WaitingForRez = 2;
+		#		print $socket "call (void) _ZN19CConfirmationDialog10ProcessYesEv(*0x4EB2CC)\r\n";
+		#	}
+		#	print $socket "c\r\n";
+		#} elsif (/Breakpoint 3, /) { # Spell finished casting
+		#	warp($CastingX, $CastingY, $CastingZ);
+		#	print $socket "dis 3\r\n";
+		#	print $socket "c\r\n";
+		} elsif (/Program received signal SIGINT, Interrupt./) {
+			if ($Ignore) {
+				print $socket "c\r\n";
+			} else {
+				advance(ADDRESS_DoPassageOfTime);
+				$GDBInterrupted = 1;
+				system "./load_string $PID \"$CommandToPass\"";
+				print $socket "call (void) _ZN10CEverQuest12InterpretCmdEP8EQPlayerPc(0x4B3A88, 0x4FE58C, 0x1900000)\r\n";
+			}
+		}
+	}
+}
+
+print "ZamielQuest initialized.\n";
+
+# Kill existing GDB processes
+foreach (`ps auwx | grep -v grep | grep gdb | awk '{print \$2}'`) {
+	chomp $_;
+	system "kill $_";
+}
+
+# Start the server
+threads->create(\&server);
+
+# Make a list of all EQ PIDs
+foreach (`ps auwx | grep -v grep | grep EverQuest | awk '{print \$2}'`) {
+	$ThreadCounter++;
+	chomp $_;
+	push @ThreadList, [threads->create(\&init, $_, $ThreadCounter, 0), $_];
+}
+
+sleep 2;
+
+while () {
+	# Scan for new instances every 5 seconds
+	if (time > $InstanceCheckTimer) {
+		$InstanceCheckTimer = time + 5;
+		foreach my $EQ_PID (`ps auwx | grep -v grep | grep EverQuest | awk '{print \$2}'`) {
+			chomp $EQ_PID;
+			my $NewEQFound = 1;
+			for (my $i = 0; $i < scalar @ThreadList; $i++) {
+				if ($ThreadList[$i][1] == $EQ_PID) {
+					$NewEQFound = 0;
+					last;
+				}
+			}
+			if ($NewEQFound) {
+				$ThreadCounter++;
+				push @ThreadList, [threads->create(\&init, $EQ_PID, $ThreadCounter, 1), $EQ_PID];
+				select(undef, undef, undef, .1);
+			}
+		}
+	}
+	# Scan for instances that have closed
+	foreach (`ps auwx | grep -v grep | grep gdb`) {
+		$_ =~ /(\d+).+--pid=(\d+)/;
+		my $EQClosed = 1;
+		foreach my $EQ_PID (`ps auwx | grep -v grep | grep EverQuest | awk '{print \$2}'`) {
+			chomp $EQ_PID;
+			if ($EQ_PID eq $2) {
+				$EQClosed = 0;
+				last;
+			}
+		}
+		if ($EQClosed) {
+			my $i = 0;
+			$i++ until $ThreadList[$i][1] eq $2;
+			system "kill $1";
+			splice(@ThreadList, $i, 1);
+			print "DEBUG Killed $1 (thread $i), thread list: " . scalar threads->list() . "\n";
+		}
+	}
+	# Scan for commands to do
+	if ($CommandToAll) {
+		$CommandToAll = 0;
+		select(undef, undef, undef, .1);
+		foreach (`ps auwx | grep -v grep | grep gdb | awk '{print \$2}'`) {
+			system "kill -s SIGINT $_";
+		}
+	}
+	# Sleep for 0.1 seconds
+	select(undef, undef, undef, .1);
+}
